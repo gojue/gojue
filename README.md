@@ -1,2 +1,2 @@
-# framework
+# Go Jue framework
 `Just Use eBPF` Golang Cli application framework
