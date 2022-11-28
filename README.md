@@ -1,6 +1,5 @@
 # Go Jue framework
-`Just Use eBPF` Golang Cli application framework
+**Go, Just Use eBPF**
 
-from github 在线的IDE
+`gojue` is a Golang Cli application framework
 
-for test
