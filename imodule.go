@@ -1,0 +1,315 @@
+// Copyright 2022 CFC4N <cfc4n.cs@gmail.com>. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package gojue
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/ringbuf"
+	"github.com/gojue/gojue/pkg/event_processor"
+	"github.com/gojue/gojue/pkg/kernel"
+	"log"
+	"os"
+	"strings"
+)
+
+type IModule interface {
+	// Init 初始化
+	Init(context.Context, *log.Logger, IConfig) error
+
+	// Name 获取当前module的名字
+	Name() string
+
+	// Run 事件监听感知
+	Run() error
+
+	// Start 启动模块
+	Start() error
+
+	// Stop 停止模块
+	Stop() error
+
+	// Close 关闭退出
+	Close() error
+
+	SetChild(module IModule)
+
+	Decode(*ebpf.Map, []byte) (IEventStruct, error)
+
+	Events() []*ebpf.Map
+
+	DecodeFun(p *ebpf.Map) (IEventStruct, bool)
+
+	Dispatcher(IEventStruct)
+}
+
+const KERNEL_LESS_5_2_PREFIX = "_less52.o"
+
+type Module struct {
+	opts   *ebpf.CollectionOptions
+	reader []IClose
+	ctx    context.Context
+	logger *log.Logger
+	child  IModule
+	// probe的名字
+	name string
+
+	// module的类型，uprobe,kprobe等
+	mType string
+
+	conf IConfig
+
+	processor       *event_processor.EventProcessor
+	isKernelLess5_2 bool //is  kernel version less 5.2
+}
+
+// Init 对象初始化
+func (this *Module) Init(ctx context.Context, logger *log.Logger, conf IConfig) {
+	this.ctx = ctx
+	this.logger = logger
+	this.processor = event_processor.NewEventProcessor(logger, conf.GetHex())
+	this.isKernelLess5_2 = false //set false default
+	kv, err := kernel.HostVersion()
+	if err != nil {
+		// nothing to do.
+	}
+	if kv < kernel.VersionCode(5, 2, 0) {
+		this.isKernelLess5_2 = true
+	}
+}
+
+func (this *Module) geteBPFName(filename string) string {
+	if this.isKernelLess5_2 {
+		return strings.Replace(filename, ".o", KERNEL_LESS_5_2_PREFIX, 1)
+	}
+	return filename
+}
+
+func (this *Module) SetChild(module IModule) {
+	this.child = module
+}
+
+func (this *Module) Start() error {
+	panic("Module.Start() not implemented yet")
+}
+
+func (this *Module) Events() []*ebpf.Map {
+	panic("Module.Events() not implemented yet")
+}
+
+func (this *Module) DecodeFun(p *ebpf.Map) (IEventStruct, bool) {
+	panic("Module.DecodeFun() not implemented yet")
+}
+
+func (this *Module) Name() string {
+	return this.name
+}
+
+func (this *Module) Run() error {
+	this.logger.Printf("%s\tModule.Run()", this.Name())
+	//  start
+	err := this.child.Start()
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		this.run()
+	}()
+
+	go func() {
+		this.processor.Serve()
+	}()
+
+	err = this.readEvents()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+func (this *Module) Stop() error {
+	return nil
+}
+
+// Stop shuts down Module
+func (this *Module) run() {
+	for {
+		select {
+		case _ = <-this.ctx.Done():
+			err := this.child.Stop()
+			if err != nil {
+				this.logger.Fatalf("%s\t stop Module error:%v.", this.child.Name(), err)
+			}
+			return
+		}
+	}
+}
+
+func (this *Module) readEvents() error {
+	var errChan = make(chan error, 8)
+	go func() {
+		for {
+			select {
+			case err := <-errChan:
+				this.logger.Printf("%s\treadEvents error:%v", this.child.Name(), err)
+			}
+		}
+	}()
+
+	for _, e := range this.child.Events() {
+		switch {
+		case e.Type() == ebpf.RingBuf:
+			this.ringbufEventReader(errChan, e)
+		case e.Type() == ebpf.PerfEventArray:
+			this.perfEventReader(errChan, e)
+		default:
+			return fmt.Errorf("%s\tunsupported mapType:%s , mapinfo:%s",
+				this.child.Name(), e.Type().String(), e.String())
+		}
+	}
+
+	return nil
+}
+
+func (this *Module) perfEventReader(errChan chan error, em *ebpf.Map) {
+	rd, err := perf.NewReader(em, os.Getpagesize()*64)
+	if err != nil {
+		errChan <- fmt.Errorf("creating %s reader dns: %s", em.String(), err)
+		return
+	}
+	this.reader = append(this.reader, rd)
+	go func() {
+		for {
+			//判断ctx是不是结束
+			select {
+			case _ = <-this.ctx.Done():
+				this.logger.Printf("%s\tperfEventReader received close signal from context.Done().", this.child.Name())
+				return
+			default:
+			}
+
+			record, err := rd.Read()
+			if err != nil {
+				if errors.Is(err, perf.ErrClosed) {
+					return
+				}
+				errChan <- fmt.Errorf("%s\treading from perf event reader: %s", this.child.Name(), err)
+				return
+			}
+
+			if record.LostSamples != 0 {
+				this.logger.Printf("%s\tperf event ring buffer full, dropped %d samples", this.child.Name(), record.LostSamples)
+				continue
+			}
+
+			var e IEventStruct
+			e, err = this.child.Decode(em, record.RawSample)
+			if err != nil {
+				this.logger.Printf("%s\tthis.child.decode error:%v", this.child.Name(), err)
+				continue
+			}
+
+			// 上报数据
+			this.Dispatcher(e)
+		}
+	}()
+}
+
+func (this *Module) ringbufEventReader(errChan chan error, em *ebpf.Map) {
+	rd, err := ringbuf.NewReader(em)
+	if err != nil {
+		errChan <- fmt.Errorf("%s\tcreating %s reader dns: %s", this.child.Name(), em.String(), err)
+		return
+	}
+	this.reader = append(this.reader, rd)
+	go func() {
+		for {
+			//判断ctx是不是结束
+			select {
+			case _ = <-this.ctx.Done():
+				this.logger.Printf("%s\tringbufEventReader received close signal from context.Done().", this.child.Name())
+				return
+			default:
+			}
+
+			record, err := rd.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					this.logger.Printf("%s\tReceived signal, exiting..", this.child.Name())
+					return
+				}
+				errChan <- fmt.Errorf("%s\treading from ringbuf reader: %s", this.child.Name(), err)
+				return
+			}
+
+			var e IEventStruct
+			e, err = this.child.Decode(em, record.RawSample)
+			if err != nil {
+				this.logger.Printf("%s\tthis.child.decode error:%v", this.child.Name(), err)
+				continue
+			}
+
+			// 上报数据
+			this.Dispatcher(e)
+		}
+	}()
+}
+
+func (this *Module) Decode(em *ebpf.Map, b []byte) (event IEventStruct, err error) {
+	es, found := this.child.DecodeFun(em)
+	if !found {
+		err = fmt.Errorf("%s\tcan't found decode function :%s, address:%p", this.child.Name(), em.String(), em)
+		return
+	}
+
+	te := es.Clone()
+	err = te.Decode(b)
+	if err != nil {
+		return nil, err
+	}
+	return te, nil
+}
+
+// 写入数据，或者上传到远程数据库，写入到其他chan 等。
+func (this *Module) Dispatcher(e IEventStruct) {
+	switch e.EventType() {
+	case EventTypeOutput:
+		if this.conf.GetHex() {
+			this.logger.Println(e.StringHex())
+		} else {
+			this.logger.Println(e.String())
+		}
+	case EventTypeEventProcessor:
+		this.processor.Write(e)
+	case EventTypeModuleData:
+		// Save to cache
+		this.child.Dispatcher(e)
+	}
+}
+
+func (this *Module) Close() error {
+	this.logger.Printf("%s\tclose", this.child.Name())
+	for _, iClose := range this.reader {
+		if err := iClose.Close(); err != nil {
+			return err
+		}
+	}
+	err := this.processor.Close()
+	return err
+}
